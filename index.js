@@ -14,6 +14,9 @@ import { startCleanupDaemon } from './cleanup.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const app = express();
+const PORT = process.env.PORT || 8000;
+
 function getLocalIp() {
   const nets = os.networkInterfaces();
   for (const name of Object.keys(nets)) {
@@ -25,9 +28,6 @@ function getLocalIp() {
   }
   return 'localhost';
 }
-
-const app = express();
-const PORT = process.env.PORT || 3001;
 
 // Start automated auto-shredder background daemon
 startCleanupDaemon(15000);
@@ -49,7 +49,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit for demo
+  limits: { fileSize: 100 * 1024 * 1024 }
 });
 
 // Prepared statements
@@ -106,6 +106,9 @@ const getStatsStmt = db.prepare(`
 const countActiveStmt = db.prepare(`
   SELECT count(*) as count FROM vaults WHERE status = 'active' AND expires_at > ?
 `);
+
+// In-memory 15-second grace cache for recently burned drops
+const recentBurnGraceCache = new Map();
 
 // --- API ROUTES ---
 
@@ -193,7 +196,6 @@ app.post('/api/vaults/file', upload.single('encrypted_file'), (req, res) => {
     } = req.body;
 
     if (!id || !iv) {
-      // Shred orphaned file
       secureShredFile(req.file.path);
       return res.status(400).json({ error: 'Missing required cryptographic payload parameters' });
     }
@@ -241,7 +243,7 @@ app.post('/api/vaults/file', upload.single('encrypted_file'), (req, res) => {
   }
 });
 
-// 3. Get Vault Metadata (Safe & Public)
+// 3. Get Vault Metadata
 app.get('/api/vaults/:id/meta', (req, res) => {
   try {
     const { id } = req.params;
@@ -282,16 +284,11 @@ app.get('/api/vaults/:id/meta', (req, res) => {
   }
 });
 
-// In-memory 15-second grace cache for recently burned drops
-// Protects mobile users against double-taps, network retries, or quick reloads
-const recentBurnGraceCache = new Map();
-
 // 4. Access/Read Text Vault Payload
 app.post('/api/vaults/:id/access', (req, res) => {
   try {
     const { id } = req.params;
 
-    // Check if within 15-second grace cache from a rapid mobile retry / double-tap
     if (recentBurnGraceCache.has(id)) {
       const cached = recentBurnGraceCache.get(id);
       return res.json({
@@ -324,13 +321,10 @@ app.post('/api/vaults/:id/access', (req, res) => {
     incrementDownloadStmt.run(id);
 
     const willBurn = vault.burn_after_read === 1 || newDownloadCount >= vault.max_downloads;
-
-    // Capture ciphertext to return before shredding
     const ciphertext = vault.ciphertext;
     const iv = vault.iv;
 
     if (willBurn) {
-      // Keep in short 15s memory cache to absorb mobile double-tap / retry
       recentBurnGraceCache.set(id, { ciphertext, iv });
       setTimeout(() => {
         recentBurnGraceCache.delete(id);
@@ -405,7 +399,7 @@ app.get('/api/vaults/:id/download', (req, res) => {
   }
 });
 
-// 6. Kill Switch / Revoke Vault Manually (Sender only)
+// 6. Revoke Vault Manually (Sender only)
 app.post('/api/vaults/:id/revoke', (req, res) => {
   try {
     const { id } = req.params;
@@ -449,15 +443,11 @@ app.get('/api/vaults/:id/status', (req, res) => {
 
     const vault = getVaultFullStmt.get(id);
     if (!vault) {
-      return res.json({
-        id,
-        status: 'shredded',
-        exists: false
-      });
+      return res.json({ id, status: 'shredded', exists: false });
     }
 
     if (vault.kill_token !== token) {
-      return res.status(403).json({ error: 'Unauthorized. Valid kill token required.' });
+      return res.status(403).json({ error: 'Unauthorized' });
     }
 
     const now = Date.now();
@@ -478,7 +468,6 @@ app.get('/api/vaults/:id/status', (req, res) => {
       exists: true
     });
   } catch (err) {
-    console.error('Error getting status:', err);
     return res.status(500).json({ error: 'Failed to get status' });
   }
 });
@@ -500,12 +489,11 @@ app.get('/api/stats', (req, res) => {
       activeVaults: activeCountRow ? activeCountRow.count : 0
     });
   } catch (err) {
-    console.error('Error getting stats:', err);
     return res.status(500).json({ error: 'Failed to retrieve stats' });
   }
 });
 
-// 9. LAN / Wi-Fi Network Info for Mobile QR Code Scanning
+// 9. LAN / Wi-Fi Network Info
 app.get('/api/network-info', (req, res) => {
   try {
     const localIp = getLocalIp();
@@ -519,20 +507,29 @@ app.get('/api/network-info', (req, res) => {
   }
 });
 
-// Serve frontend build if exists
-const clientDistPath = path.join(__dirname, '..', 'client', 'dist');
-if (fs.existsSync(clientDistPath)) {
-  app.use(express.static(clientDistPath));
-  app.use((req, res, next) => {
-    if (req.method === 'GET' && !req.path.startsWith('/api')) {
-      return res.sendFile(path.join(clientDistPath, 'index.html'));
-    }
-    next();
-  });
-}
+// Serve static frontend build
+// Universal static file server: works whether files are in root or nested
+const staticDir = fs.existsSync(path.join(__dirname, 'client', 'dist'))
+  ? path.join(__dirname, 'client', 'dist')
+  : fs.existsSync(path.join(__dirname, '..', 'client', 'dist'))
+  ? path.join(__dirname, '..', 'client', 'dist')
+  : __dirname;
+
+app.use(express.static(staticDir));
+app.use('/assets', express.static(staticDir));
+app.use('/assets', express.static(path.join(staticDir, 'assets')));
+
+app.use((req, res, next) => {
+  if (req.method === 'GET' && !req.path.startsWith('/api')) {
+    const indexPath = fs.existsSync(path.join(staticDir, 'index.html'))
+      ? path.join(staticDir, 'index.html')
+      : path.join(__dirname, 'index.html');
+    return res.sendFile(indexPath);
+  }
+  next();
+});
 
 const localIp = getLocalIp();
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[VaultDrop Server] Local:   http://localhost:${PORT}`);
-  console.log(`[VaultDrop Server] Network: http://${localIp}:${PORT}`);
+  console.log(`[VaultDrop Server] Listening on port ${PORT}`);
 });
